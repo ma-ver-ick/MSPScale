@@ -1,0 +1,292 @@
+/*********************************************************************
+This is an example for our Monochrome OLEDs based on SSD1306 drivers
+
+  Pick one up today in the adafruit shop!
+  ------> http://www.adafruit.com/category/63_98
+
+This example is for a 128x64 size display using SPI to communicate
+4 or 5 pins are required to interface
+
+Adafruit invests time and resources providing this open source code,
+please support Adafruit and open-source hardware by purchasing
+products from Adafruit!
+
+Written by Limor Fried/Ladyada  for Adafruit Industries.
+BSD license, check license.txt for more information
+All text above, and the splash screen must be included in any redistribution
+*********************************************************************/
+
+#include <avr/interrupt.h>
+#include <avr/power.h>
+#include <avr/sleep.h>
+#include <avr/wdt.h>
+
+// #include <SPI.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Fonts/FreeMono9pt7b.h>
+#include <Fonts/FreeSansBold12pt7b.h>
+#include "HX711.h"
+#include "ADCTouch.h"
+#include "Sleep_n0m1.h"
+
+// If using software SPI (the default case):
+#define OLED_MOSI   9
+#define OLED_CLK   10
+#define OLED_DC    11
+#define OLED_CS    12
+#define OLED_RESET 8
+Adafruit_SSD1306 display(OLED_MOSI, OLED_CLK, OLED_DC, OLED_RESET, OLED_CS);
+
+/* Uncomment this block to use hardware SPI
+#define OLED_DC     6
+#define OLED_CS     7
+#define OLED_RESET  8
+Adafruit_SSD1306 display(OLED_DC, OLED_RESET, OLED_CS);
+*/
+
+#define WINDOW 50
+#define CALIBRATION_SAMPLES 500
+#define CALIBRATION_REPORT_AT 10
+#define MAX_WEIGHT_GRAMS 1000
+#define MAX_WEIGHT_KG 5
+#define MAX_WEIGHT_MG 1000
+
+int state = 0;
+
+HX711 scale;
+float ratio = 83860.0f/345.0f;
+long values[WINDOW];
+int values_idx = 0;
+long offset;
+unsigned long lastReportingTime;
+unsigned long timeEnteredState1;
+Sleep sleep;
+int ref_buttonLeft;
+int ref_buttonRight;
+
+#if (SSD1306_LCDHEIGHT != 64)
+#error("Height incorrect, please fix Adafruit_SSD1306.h!");
+#endif
+
+bool readButtonRight();
+bool readButtonLeft();
+void calibrate();
+void calibrateTare();
+void drawWeight(float weight);
+void switchToState0();
+void loop_state0(); // display weight
+void switchToState1();
+void loop_state1(); // sleep - wake up - sleep
+
+void setup()   {
+  // Serial.begin(115200);
+
+  pinMode(7, OUTPUT);
+  digitalWrite(7, HIGH);
+
+  sleep.pwrDownMode();
+
+  scale.begin(A1, A0);
+
+  // by default, we'll generate the high voltage from the 3.3v line internally! (neat!)
+  display.begin(SSD1306_SWITCHCAPVCC);
+  display.clearDisplay();
+  display.display();
+
+  calibrate();
+
+  timeEnteredState1 = millis();
+}
+
+
+void loop() {
+  if(state == 0) {
+    loop_state0();
+  } else if(state == 1) {
+    loop_state1();
+  }
+}
+
+void loop_state1() {
+  sleep.sleepDelay(1000);
+
+  if(readButtonRight()) {
+    switchToState0();
+  }
+}
+
+void loop_state0() {
+  values_idx = (values_idx + 1) % WINDOW;
+  values[values_idx] = scale.read();
+
+  if(lastReportingTime == 0 || millis() - lastReportingTime >= 500) {
+    long sum = 0;
+    for(int i = 0; i < WINDOW; i++) {
+      sum += (values[i] - offset);
+    }
+    float v = sum / (WINDOW * 1.0); // / ratio;
+
+    display.clearDisplay();
+    drawWeight(v);
+    display.display();
+    lastReportingTime = millis();
+
+    if(readButtonRight()) {
+      calibrateTare();
+    }
+  }
+  delay(1);
+
+  if( (millis() - timeEnteredState1) > 20000) { // 20 secs
+    switchToState1();
+  }
+}
+
+void drawWeight(float weight) {
+  float progress = 0;
+  float progressMax = 0;
+  String text;
+  boolean neg = weight < 0;
+  weight = abs(weight);
+
+  // if(weight > MAX_WEIGHT_KG * 1000) {
+  //   text = String("MAX");
+  //
+  //   progressMax = 1000;
+  //   progress = 0;
+  // } else
+  // if(weight > 1000) {
+  //   weight = weight / 1000;
+  //   text = String(weight, 3) + " kg";
+  //
+  //   progressMax = MAX_WEIGHT_KG;
+  //   progress = (SSD1306_LCDWIDTH - 10) / progressMax * weight;
+  // } else if(weight > 1) {
+  //   text = String(weight, 0) + " g";
+  //
+  //   progressMax = MAX_WEIGHT_GRAMS;
+  //   progress = (SSD1306_LCDWIDTH - 10) / progressMax * weight;
+  // } else {
+  //   weight = weight * 1000;
+  //   text = String(weight, 0) + " mg";
+  //
+  //   progressMax = MAX_WEIGHT_MG;
+  //   progress = (SSD1306_LCDWIDTH - 10) / progressMax * weight;
+  // }
+  text = String(weight, 0);
+  progressMax = 0;
+  progress = 0;
+
+  if(neg) {
+    text = "-" + text;
+  }
+
+  int16_t  x1, y1;
+  uint16_t w, h;
+
+  display.getTextBounds(text.c_str(), (int16_t)0, (int16_t)0, &x1, &y1, &w, &h);
+
+  int x = SSD1306_LCDWIDTH - w;
+  x = x / 2;
+
+  int y = SSD1306_LCDHEIGHT - h - 10; // we are positioning the bottom of the baseline
+
+  display.setCursor(x, y);
+  display.println(text);
+
+  display.fillRect(5, 50, progress, 5, 1);
+}
+
+void calibrate() {
+  display.setTextSize(1);
+  display.setFont(&FreeSansBold12pt7b);
+  display.setTextColor(WHITE);
+  display.setCursor(0, 30);
+
+  display.println("Calibrating");
+  display.display();
+  delay(200); // let the user remove his finger!
+
+  float progressBarStep = (SSD1306_LCDWIDTH - 10) / (CALIBRATION_SAMPLES*1.0f);
+  int progressBar = 0;
+
+  // Calculate the offset
+  float sum = 0;
+  for(int i = 0; i < CALIBRATION_SAMPLES; i++) {
+    float temp = scale.read();
+
+    values[i % WINDOW] = temp;
+    sum += temp;
+    if(i % CALIBRATION_REPORT_AT == 0) {
+      progressBar = progressBarStep * i;
+      display.fillRect(5, 50, progressBar, 5, 1);
+      display.display();
+    }
+  }
+
+  offset = sum / CALIBRATION_SAMPLES;
+  lastReportingTime = 0;
+
+  ref_buttonLeft = ADCTouch.read(A3, 1000);
+  ref_buttonRight = ADCTouch.read(A2, 1000);
+}
+
+void calibrateTare() {
+  // Calculate the offset
+  float sum = 0;
+  for(int i = 0; i < WINDOW; i++) {
+    sum += values[i];
+  }
+
+  offset = sum / WINDOW;
+}
+
+void switchToState0() {
+  state = 0;
+  display.ssd1306_command(SSD1306_DISPLAYON);
+  display.clearDisplay();
+
+  scale.power_up();
+
+  calibrate();
+
+  timeEnteredState1 = millis();
+}
+
+void switchToState1() {
+  state = 1;
+  // display.clearDisplay();
+  // display.display();
+
+  display.ssd1306_command(SSD1306_DISPLAYOFF);
+
+  scale.power_down();
+}
+
+bool readButton(byte channel) {
+  int value0 = ADCTouch.read(channel, 500);
+  return value0 - ref_buttonRight >= 10;
+}
+
+bool readButtonRight() {
+  return readButton(A2);
+}
+
+bool readButtonLeft() {
+  return readButton(A3);
+}
+
+
+
+// void sleep() {
+//   set_sleep_mode(SLEEP_MODE_PWR_DOWN);
+//   sleep_enable(); // PREPARE SLEEP (?)
+//   power_adc_disable(); // Turn off the ADC while asleep.
+//
+//   sleep_cpu(); // SLEEP
+//   sleep_disable(); // UN-SLEEP
+//
+//   power_all_enable();
+// }
