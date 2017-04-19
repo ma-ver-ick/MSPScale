@@ -38,23 +38,16 @@
 #define SCALE_CALIBRATION_SAMPLES_MAX     1000
 #define SCALE_CALIBRATION_REPORT_AT       10
 
-#define MAX_WEIGHT_GRAMS                  1000
-#define MAX_WEIGHT_KG                     5
-#define MAX_WEIGHT_MG                     1000
+#define MAX_WEIGHT_GRAMS                  1000.0f
+#define MAX_WEIGHT_KG                     5.0f
+#define MAX_WEIGHT_MG                     1000.0f
 
 #define PWR_DOWN_TIME_MIN                 10
 #define PWR_DOWN_TIME_MAX                 210
 
+#define CALIBRATION_FACTOR_MIN            10
+#define CALIBRATION_FACTOR_MAX            500
 // # /Configuration
-
-
-// # Error checking
-
-#if (SSD1306_LCDHEIGHT != 64)
-#error("Height incorrect, please fix Adafruit_SSD1306.h!");
-#endif
-
-// # /Error Checking
 
 // # State machine
 #define STATE_MEASURE                     0
@@ -89,11 +82,14 @@ byte _buttonRightPressedLastIteration             = 0;
 #define MENU_ITEM_SCALE_SUB_GRAMM                 3
 #define MENU_ITEM_HX711_HIGH_SPEED                4
 #define MENU_ITEM_CALIBRATION_MODE                5
-#define MENU_ITEM_RESET                           7
-#define MENU_ITEM_EXIT                            6
+#define MENU_ITEM_CALIBRATION_FACTOR              6
+#define MENU_ITEM_EXIT                            7
+#define MENU_ITEM_RESET                           8
 
 #define EEPROM_TRUE                               2
 #define EEPROM_FALSE                              1
+
+#define MENU_FAST_UPDATE_TOLERANCE                5
 // #/Menu
 
 // # Saved Settings
@@ -103,6 +99,7 @@ byte _buttonRightPressedLastIteration             = 0;
 #define DEFAULT_CONFIG_SCALE_SUB_GRAMM            true
 #define DEFAULT_CONFIG_HX711_HIGH_SPEED           HIGH
 #define DEFAULT_CONFIG_CALIBRATION_MODE           false
+#define DEFAULT_CONFIG_CALIBRATION_FACTOR         248.9487f
 
 byte _config_pwr_down_time              = DEFAULT_CONFIG_PWR_DOWN_TIME; // seconds
 byte _config_scale_calibration_samples  = DEFAULT_CONFIG_SCALE_CALIBRATION_SAMPLES;
@@ -110,6 +107,7 @@ byte _config_scale_measure_samples      = DEFAULT_CONFIG_SCALE_MEASURE_SAMPLES;
 bool _config_scale_sub_gramm            = DEFAULT_CONFIG_SCALE_SUB_GRAMM;
 bool _config_hx711_high_speed           = DEFAULT_CONFIG_HX711_HIGH_SPEED;
 bool _config_calibration_mode           = DEFAULT_CONFIG_CALIBRATION_MODE;
+float _config_calibration_factor        = DEFAULT_CONFIG_CALIBRATION_FACTOR;
 // # /Saved Settings
 
 // # PROGMEM
@@ -117,7 +115,6 @@ bool _config_calibration_mode           = DEFAULT_CONFIG_CALIBRATION_MODE;
 
 void setup() {
   // init scale
-  // Serial.begin(115200);
   _scale.begin(SCALE_PIN0, SCALE_PIN1);
   pinMode(SCALE_SPEED_PIN, OUTPUT);
   digitalWrite(SCALE_SPEED_PIN, HIGH);
@@ -129,14 +126,6 @@ void setup() {
   _display.setTextColor(WHITE);
 
   loadFromEEPROM();
-
-  _sleep.pwrDownMode();
-
-  // Serial.println(_config_pwr_down_time);
-  // Serial.println(_config_scale_calibration_samples);
-  // Serial.println(_config_scale_measure_samples);
-  // Serial.println(_config_hx711_high_speed);
-  // Serial.println(_config_calibration_mode);
 
   switchToStateMeasure();
 }
@@ -157,12 +146,12 @@ void loop_stateMenu() {
   _display.display();
 
   if(readButtonLeft()) {
-    _stateMachine_menuItem = (_stateMachine_menuItem + 1) % 8;
+    _stateMachine_menuItem = (_stateMachine_menuItem + 1) % 9;
     delay(100);
   }
   if(readButtonRight()) {
     executeCurrentMenuItem();
-    if(_buttonRightPressedLastIteration >= 5) {
+    if(_buttonRightPressedLastIteration >= MENU_FAST_UPDATE_TOLERANCE) {
       delay(20);
     } else {
       delay(100);
@@ -177,14 +166,14 @@ void loop_stateMeasure() {
   _measure_window_idx = (_measure_window_idx + 1) % _config_scale_measure_samples;
   _measure_window[_measure_window_idx] = _scale.read();
 
-  if(_lastReportingTime_Measure == 0
-    || millis() - _lastReportingTime_Measure >= 250) {
+  int temp = (millis() - (unsigned long)_lastReportingTime_Measure);
+  if(temp >= 250) {
 
     float v = 0;
     for(int i = 0; i < _config_scale_measure_samples; i++) {
       v += (_measure_window[i] - _measure_offset);
     }
-    v = v / (_config_scale_measure_samples * 1.0);
+    v = v / (_config_scale_measure_samples * 1.0f);
 
     _display.clearDisplay();
     if(_config_calibration_mode) {
@@ -192,7 +181,7 @@ void loop_stateMeasure() {
       _display.setTextSize(1);
       drawTextCentered(String(v, 0));
     } else {
-      v = v / (83860.0f/345.0f);
+      v = v / _config_calibration_factor;
       drawWeight(v);
     }
     _display.display();
@@ -207,11 +196,12 @@ void loop_stateMeasure() {
     switchToStateMenu();
   }
 
-  if( (millis() - _timeEnteredState) > (_config_pwr_down_time * 1000)) {
+  if( (millis() - _timeEnteredState) > (unsigned long)(_config_pwr_down_time * 1000L)) {
     switchToStatePwrDown();
   }
 
-  // delay(5);
+  // 80 SPS from HX711 would mean a sample every 12.5ms, so this fast running loop could be throttled to safe power.
+  _sleep.sleepDelay(10);
 }
 
 void calibrateTare() {
@@ -227,8 +217,6 @@ void calibrateTare() {
   }
 
   _measure_offset = sum / _config_scale_measure_samples;
-
-  delay(100);
 }
 
 void loop_statePwrDown() {
@@ -245,10 +233,13 @@ void switchToStateMeasure() {
   _display.clearDisplay();
 
   digitalWrite(SCALE_SPEED_PIN, _config_hx711_high_speed);
+  _buttonRightPressedLastIteration = 0;
 
   _scale.power_up();
 
   calibrate();
+
+  _sleep.idleMode();
 
   _lastReportingTime_Measure = millis();
   _timeEnteredState = millis();
@@ -261,6 +252,7 @@ void switchToStatePwrDown() {
 
   _display.ssd1306_command(SSD1306_DISPLAYOFF);
 
+  _sleep.pwrDownMode();
   _scale.power_down();
 }
 
@@ -290,12 +282,12 @@ void drawWeight(float weight) {
 
   text.reserve(10);
 
-  if(weight > MAX_WEIGHT_KG * 1000) {
+  if(weight > MAX_WEIGHT_KG * 1000.0f) {
     text = String(F("MAX"));
 
-    progressMax = 1000;
+    progressMax = 1000.0f;
     progress = 0;
-  } else if(weight > 1000) {
+  } else if(weight > 1000.0f) {
     weight = weight / 1000.0f;
     text += String(weight, 3) + F(" kg");
 
@@ -317,8 +309,6 @@ void drawWeight(float weight) {
     text = F("0 g");
     progress = 0;
   }
-
-
 
   int16_t  x1, y1;
   uint16_t w, h;
@@ -390,7 +380,6 @@ bool readButtonLeft() {
   return value0 - _ref_buttonLeft >= BUTTON_TOLERANCE;
 }
 
-
 void calibrate() {
   _display.setTextSize(1);
   _display.setFont(&FreeSansBold12pt7b);
@@ -448,13 +437,15 @@ void drawMenu() {
   } else if (_stateMachine_menuItem == MENU_ITEM_SCALE_SUB_GRAMM) {
     drawSingleMenuEntry(F("Show sub gramm?"), EMPTY_STRING, _config_scale_sub_gramm ? F("On") : F("Off"));
   } else if (_stateMachine_menuItem == MENU_ITEM_HX711_HIGH_SPEED) {
-    drawSingleMenuEntry(F("HX711 60Hz update"), F("mode?"), _config_hx711_high_speed ? F("80 SPS") : F("10 SPS"));
+    drawSingleMenuEntry(F("HX711 update rate"), EMPTY_STRING, _config_hx711_high_speed ? F("80 Hz") : F("10 Hz"));
   } else if (_stateMachine_menuItem == MENU_ITEM_CALIBRATION_MODE) {
     drawSingleMenuEntry(F("Calibration mode?"), EMPTY_STRING, _config_calibration_mode ? F("On") : F("Off"));
   } else if (_stateMachine_menuItem == MENU_ITEM_RESET) {
     drawSingleMenuEntry(F("Reset to defaults?"), EMPTY_STRING, YES);
   } else if (_stateMachine_menuItem == MENU_ITEM_EXIT) {
     drawSingleMenuEntry(F("Exit?"), EMPTY_STRING, YES);
+  } else if(_stateMachine_menuItem == MENU_ITEM_CALIBRATION_FACTOR) {
+    drawSingleMenuEntry(F("Calibration factor"), EMPTY_STRING, String(_config_calibration_factor, 4));
   }
 }
 
@@ -479,6 +470,16 @@ void executeCurrentMenuItem() {
   } else if (_stateMachine_menuItem == MENU_ITEM_EXIT) {
     switchToStateMeasure();
     return; // prevent store to eeprom
+  } else if (_stateMachine_menuItem == MENU_ITEM_CALIBRATION_FACTOR) {
+    if(_buttonRightPressedLastIteration >= MENU_FAST_UPDATE_TOLERANCE) {
+      _config_calibration_factor = _config_calibration_factor + 0.5f;
+    } else {
+      _config_calibration_factor = _config_calibration_factor + 0.0001f;
+    }
+    if(_config_calibration_factor > CALIBRATION_FACTOR_MAX) {
+      _config_calibration_factor = _config_calibration_factor - CALIBRATION_FACTOR_MAX;
+    }
+    _config_calibration_factor = constrain(_config_calibration_factor, CALIBRATION_FACTOR_MIN, CALIBRATION_FACTOR_MAX);
   }
   storeToEEPROM();
 }
@@ -490,6 +491,14 @@ void resetToDefaults() {
   _config_scale_sub_gramm             = DEFAULT_CONFIG_SCALE_SUB_GRAMM;
   _config_hx711_high_speed            = DEFAULT_CONFIG_HX711_HIGH_SPEED;
   _config_calibration_mode            = DEFAULT_CONFIG_CALIBRATION_MODE;
+  _config_calibration_factor          = DEFAULT_CONFIG_CALIBRATION_FACTOR;
+
+  _display.clearDisplay();
+  _display.setTextSize(1);
+  _display.setFont(&FreeSansBold12pt7b);
+  drawTextCentered(F("Reset"));
+  _display.display();
+  delay(500);
 }
 
 void loadFromEEPROM() {
@@ -499,6 +508,7 @@ void loadFromEEPROM() {
   _config_scale_sub_gramm             = eeprom_read(3, DEFAULT_CONFIG_SCALE_SUB_GRAMM ? EEPROM_TRUE : EEPROM_FALSE) == EEPROM_TRUE ? true : false;
   _config_hx711_high_speed            = eeprom_read(4, DEFAULT_CONFIG_HX711_HIGH_SPEED == HIGH ? EEPROM_TRUE : EEPROM_FALSE) == EEPROM_TRUE ? HIGH : LOW;
   _config_calibration_mode            = eeprom_read(5, DEFAULT_CONFIG_CALIBRATION_MODE ? EEPROM_TRUE : EEPROM_FALSE) == EEPROM_TRUE ? true : false;
+  EEPROM.get(6, _config_calibration_factor);
 }
 
 void storeToEEPROM() {
@@ -508,4 +518,13 @@ void storeToEEPROM() {
   EEPROM.update(3, _config_scale_sub_gramm ? EEPROM_TRUE : EEPROM_FALSE);
   EEPROM.update(4, _config_hx711_high_speed == HIGH ? EEPROM_TRUE : EEPROM_FALSE);
   EEPROM.update(5, _config_calibration_mode ? EEPROM_TRUE : EEPROM_FALSE);
+  EEPROM.put(6, _config_calibration_factor);
 }
+
+
+
+// # Error checking
+#if (SSD1306_LCDHEIGHT != 64)
+#error("Height incorrect, please fix Adafruit_SSD1306.h!");
+#endif
+// # /Error Checking
